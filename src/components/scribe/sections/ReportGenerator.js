@@ -16,6 +16,7 @@ const ReportGenerator = ({
   isGenerating,
   onDownload,
   onSendEmail,
+  onViewStoredCopy,
   reportMeta,
   defaultRecipients,
   defaultSubjects,
@@ -104,6 +105,14 @@ const ReportGenerator = ({
               disabled={!hasReport}
             >
               Download as PDF
+            </button>
+            <button
+              className="scribe-btn outline"
+              onClick={onViewStoredCopy}
+              disabled={!hasReport || !reportMeta?.gcsObjectPath}
+              title={!reportMeta?.gcsObjectPath ? 'No stored copy uploaded yet.' : 'View stored copy from GCS via Chronos API'}
+            >
+              View stored copy
             </button>
             <button
               className="scribe-btn outline"

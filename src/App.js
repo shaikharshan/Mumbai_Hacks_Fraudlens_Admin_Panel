@@ -1,9 +1,8 @@
 import React, { useState, useEffect } from 'react';
-import { BrowserRouter as Router, Routes, Route, Link, Navigate } from 'react-router-dom';
+import { BrowserRouter as Router, Routes, Route, Link } from 'react-router-dom';
 import { 
   collection, 
   query, 
-  where, 
   orderBy, 
   limit, 
   onSnapshot,
@@ -12,7 +11,6 @@ import {
   getDocs,
   Timestamp,
   getDoc,
-  addDoc,
   increment
 } from 'firebase/firestore';
 import { 
@@ -25,7 +23,6 @@ import {
   MapPin, 
   TrendingUp,
   Eye,
-  Download,
   RefreshCw,
   Database,
   Search,
@@ -38,7 +35,7 @@ import {
   Copy,
   ExternalLink
 } from 'lucide-react';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, BarChart, Bar } from 'recharts';
+import { XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, BarChart, Bar } from 'recharts';
 import { db } from './firebase';
 import ScribeDashboard from './components/scribe/ScribeDashboard';
 import { generateRequiredReportsForIncident } from './components/scribe/scribeService';
@@ -62,6 +59,8 @@ const FraudLensAdminPanel = () => {
   const [scribeAutoPromptTransactionId, setScribeAutoPromptTransactionId] = useState(null);
   const [scribeAutoGenerating, setScribeAutoGenerating] = useState(false);
   const [scribeAutoDoneCount, setScribeAutoDoneCount] = useState(null);
+  const [scribeAutoDoneReports, setScribeAutoDoneReports] = useState(null);
+  const [scribeAutoDoneIncidentId, setScribeAutoDoneIncidentId] = useState(null);
   const [scribeAutoError, setScribeAutoError] = useState(null);
 
   // Direct link to NCRP complaint acceptance page so users land closer to the form.
@@ -90,10 +89,22 @@ const FraudLensAdminPanel = () => {
     return parts.join('\n');
   };
 
-  const openNCRPReportFlow = (transaction) => {
+  const openNCRPReportFlow = async (transaction) => {
     setNcrpReportTransaction(transaction);
     setNcrpModalOpen(true);
     window.open(NCRP_PORTAL_URL, '_blank', 'noopener,noreferrer');
+
+    // Mark NCRP flow as initiated on the transaction for exec/NCRP widgets
+    try {
+      if (transaction?.id) {
+        await updateDoc(doc(db, 'transactions', transaction.id), {
+          ncrpStatus: 'initiated',
+          ncrpOpenedAt: Timestamp.now()
+        });
+      }
+    } catch (err) {
+      console.error('Failed to update NCRP status on transaction', err);
+    }
   };
 
   const copyNCRPReportToClipboard = () => {
@@ -476,6 +487,8 @@ const FraudLensAdminPanel = () => {
 
       if (status.toLowerCase() === 'blocked') {
         setScribeAutoDoneCount(null);
+        setScribeAutoDoneReports(null);
+        setScribeAutoDoneIncidentId(null);
         setScribeAutoError(null);
         setScribeAutoPromptTransactionId(transactionId);
       } else {
@@ -494,6 +507,8 @@ const FraudLensAdminPanel = () => {
     try {
       const results = await generateRequiredReportsForIncident(db, scribeAutoPromptTransactionId);
       setScribeAutoDoneCount(results.length);
+      setScribeAutoDoneReports(results);
+      setScribeAutoDoneIncidentId(scribeAutoPromptTransactionId);
       setScribeAutoPromptTransactionId(null);
     } catch (err) {
       console.error('Scribe auto-generate failed', err);
@@ -1810,7 +1825,6 @@ const FraudLensAdminPanel = () => {
                 {transactions.slice(0, 6).map(transaction => {
                   const payerUser = getUserDetails(transaction.payerUserId);
                   const receiverUser = getUserDetails(transaction.receiverUserId);
-                  const severity = getFraudSeverity(transaction);
                   
                   return (
                     <div key={transaction.id} style={transactionCardStyle}>
@@ -1978,8 +1992,26 @@ const FraudLensAdminPanel = () => {
         <div style={{ position: 'fixed', bottom: 24, left: '50%', transform: 'translateX(-50%)', zIndex: 9999, background: '#059669', color: 'white', padding: '12px 20px', borderRadius: 8, boxShadow: '0 4px 12px rgba(0,0,0,0.15)', display: 'flex', alignItems: 'center', gap: 12 }}>
           <CheckCircle size={20} />
           <span>{scribeAutoDoneCount} reports generated. Open Scribe to send to authorities.</span>
-          <Link to="/reports" style={{ color: 'white', fontWeight: 600, textDecoration: 'underline' }}>Open Scribe</Link>
-          <button type="button" onClick={() => setScribeAutoDoneCount(null)} style={{ background: 'transparent', border: 'none', color: 'white', cursor: 'pointer', fontSize: 18, lineHeight: 1 }} aria-label="Dismiss">×</button>
+          <Link
+            to={`/reports?reportIds=${encodeURIComponent(
+              (scribeAutoDoneReports || []).map(r => r.reportId).filter(Boolean).join(',')
+            )}&incidentId=${encodeURIComponent(scribeAutoDoneIncidentId || '')}`}
+            style={{ color: 'white', fontWeight: 600, textDecoration: 'underline' }}
+          >
+            Open latest reports
+          </Link>
+          <button
+            type="button"
+            onClick={() => {
+              setScribeAutoDoneCount(null);
+              setScribeAutoDoneReports(null);
+              setScribeAutoDoneIncidentId(null);
+            }}
+            style={{ background: 'transparent', border: 'none', color: 'white', cursor: 'pointer', fontSize: 18, lineHeight: 1 }}
+            aria-label="Dismiss"
+          >
+            ×
+          </button>
         </div>
       )}
     </div>

@@ -8,7 +8,8 @@ import {
   collection,
   doc,
   getDoc,
-  serverTimestamp
+  serverTimestamp,
+  updateDoc
 } from 'firebase/firestore';
 import {
   PROMPT_TEMPLATES,
@@ -87,14 +88,51 @@ export async function generateAndSaveReport(db, incidentId, reportType) {
     content: reportText,
     recipients: recipientsList,
     subject,
-    generatedAt: serverTimestamp()
+    generatedAt: serverTimestamp(),
+    status: 'draft'
   });
+
+  // Upload a stored copy to GCS via Chronos API (Cloud Run).
+  // This keeps the bucket private and gives us a sha256 hash to later anchor on-chain.
+  let gcs = null;
+  try {
+    const base = process.env.REACT_APP_CHRONOS_API?.trim();
+    if (base) {
+      const resp = await fetch(`${base.replace(/\/$/, '')}/api/docs/upload`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          incidentId,
+          reportType,
+          content: reportText
+        })
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data?.gcsPath && data?.sha256 && data?.objectPath) {
+          gcs = { gcsPath: data.gcsPath, sha256: data.sha256, objectPath: data.objectPath };
+          await updateDoc(doc(db, 'scribe_reports', docRef.id), {
+            gcsPath: data.gcsPath,
+            gcsObjectPath: data.objectPath,
+            gcsSha256: data.sha256,
+            gcsUploadedAt: serverTimestamp()
+          });
+        }
+      }
+    }
+  } catch (err) {
+    // Non-fatal for report generation
+    console.error('Chronos/GCS upload failed (non-fatal)', err);
+  }
 
   return {
     reportId: docRef.id,
     reportType,
     subject,
-    recipients: recipientsList
+    recipients: recipientsList,
+    incidentId,
+    content: reportText,
+    gcs
   };
 }
 

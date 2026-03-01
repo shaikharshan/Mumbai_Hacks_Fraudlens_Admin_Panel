@@ -1,7 +1,6 @@
 import React from 'react';
 import {
   ORG_NAME,
-  DPO_CONTACT,
   REPORTING_CONTACT,
   MARKDOWN_SECTIONS
 } from './reportFormats';
