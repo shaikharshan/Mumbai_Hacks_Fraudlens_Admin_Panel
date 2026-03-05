@@ -92,11 +92,13 @@ export async function generateAndSaveReport(db, incidentId, reportType) {
     status: 'draft'
   });
 
-  // Upload a stored copy to GCS via Chronos API (Cloud Run).
-  // This keeps the bucket private and gives us a sha256 hash to later anchor on-chain.
+  // Upload a stored copy to GCS via Chronos API (VM or Cloud Run).
+  // Prefer REACT_APP_CHRONOS_API_URL (GCP VM); fallback to REACT_APP_CHRONOS_API.
   let gcs = null;
   try {
-    const base = process.env.REACT_APP_CHRONOS_API?.trim();
+    const vm = process.env.REACT_APP_CHRONOS_API_URL?.trim();
+    const cloudRun = process.env.REACT_APP_CHRONOS_API?.trim();
+    const base = vm || cloudRun;
     if (base) {
       const resp = await fetch(`${base.replace(/\/$/, '')}/api/docs/upload`, {
         method: 'POST',

@@ -11,7 +11,8 @@ import {
   getDocs,
   Timestamp,
   getDoc,
-  increment
+  increment,
+  where
 } from 'firebase/firestore';
 import { 
   AlertTriangle, 
@@ -39,6 +40,8 @@ import { XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pi
 import { db } from './firebase';
 import ScribeDashboard from './components/scribe/ScribeDashboard';
 import { generateRequiredReportsForIncident } from './components/scribe/scribeService';
+import { commitFraudDecision, getIncidentHistory, verifyDocument } from './services/chronosService';
+import { getBankFromVpa, getBankPersonaFromUrl, getBankBadgeStyle } from './utils/bankHelper';
 import { useAuth } from './contexts/AuthContext';
 import ProtectedRoute from './components/ProtectedRoute';
 import Login from './pages/Login';
@@ -62,6 +65,11 @@ const FraudLensAdminPanel = () => {
   const [scribeAutoDoneReports, setScribeAutoDoneReports] = useState(null);
   const [scribeAutoDoneIncidentId, setScribeAutoDoneIncidentId] = useState(null);
   const [scribeAutoError, setScribeAutoError] = useState(null);
+  const [commitLedgerLoading, setCommitLedgerLoading] = useState(false);
+  const [commitLedgerError, setCommitLedgerError] = useState(null);
+  const [ledgerCommittedFor, setLedgerCommittedFor] = useState(null);
+  const [incidentHistory, setIncidentHistory] = useState(null);
+  const [evidenceReports, setEvidenceReports] = useState([]);
 
   // Direct link to NCRP complaint acceptance page so users land closer to the form.
   const NCRP_PORTAL_URL = 'https://cybercrime.gov.in/Webform/Accept.aspx';
@@ -465,7 +473,6 @@ const FraudLensAdminPanel = () => {
           console.log('💰 Balance updates completed successfully');
         }
       } else if (status.toLowerCase() === 'blocked') {
- 
         const payerUpdated = await updateUserBalance(payerUserId, amount, false); // Credit
         const receiverUpdated = await updateUserBalance(receiverUserId, amount, true); // Debit
         
@@ -473,6 +480,20 @@ const FraudLensAdminPanel = () => {
           alert('⚠️ Transaction blocked but balance update failed for some users');
         } else {
           console.log('💰 Balance updates completed successfully');
+        }
+
+        // Chronos ledger commit (non-blocking; user can retry via Confirm Fraud button)
+        const payerBank = getBankFromVpa(transaction.payerVpa);
+        const ledgerResult = await commitFraudDecision(
+          transactionId,
+          'FRAUD_CONFIRMED',
+          'ADMIN_BLOCKED',
+          [],
+          profile?.email || 'admin',
+          payerBank.code
+        );
+        if (!ledgerResult.ok) {
+          console.warn('Chronos ledger commit failed:', ledgerResult.error);
         }
       }
       
@@ -524,6 +545,79 @@ const FraudLensAdminPanel = () => {
     if (!scribeAutoGenerating) {
       alert('✅ Transaction blocked successfully!');
     }
+  };
+
+  /** Fetch Scribe reports for an incident (objectPath, sha256, reportType) for Chronos commit */
+  const getScribeReportsForIncident = async (incidentId) => {
+    try {
+      const q = query(
+        collection(db, 'scribe_reports'),
+        where('incidentId', '==', incidentId)
+      );
+      const snap = await getDocs(q);
+      return snap.docs
+        .filter(d => {
+          const d2 = d.data();
+          return d2.gcsObjectPath && d2.gcsSha256;
+        })
+        .map(d => {
+          const d2 = d.data();
+          return {
+            objectPath: d2.gcsObjectPath,
+            sha256: d2.gcsSha256,
+            reportType: d2.reportType
+          };
+        });
+    } catch (err) {
+      console.error('Failed to fetch scribe reports for incident', err);
+      return [];
+    }
+  };
+
+  /** Confirm fraud and commit decision to Chronos ledger */
+  const handleConfirmFraudAndCommitLedger = async (transaction) => {
+    if (!transaction?.id) return;
+    setCommitLedgerLoading(true);
+    setCommitLedgerError(null);
+    try {
+      const reports = await getScribeReportsForIncident(transaction.id);
+      const payerBank = getBankFromVpa(transaction.payerVpa);
+      const result = await commitFraudDecision(
+        transaction.id,
+        'FRAUD_CONFIRMED',
+        'ADMIN_CONFIRMED',
+        reports,
+        profile?.email || 'admin',
+        payerBank.code
+      );
+      if (result.ok) {
+        setLedgerCommittedFor(transaction.id);
+        setIncidentHistory(prev => prev?.incidentId === transaction.id ? null : prev);
+        const hist = await getIncidentHistory(transaction.id);
+        if (hist.ok && hist.data) setIncidentHistory(hist.data);
+      } else {
+        setCommitLedgerError(result.error || 'Ledger commit failed');
+      }
+    } catch (err) {
+      setCommitLedgerError(err.message || 'Ledger commit failed');
+    } finally {
+      setCommitLedgerLoading(false);
+    }
+  };
+
+  /** Load incident history and evidence reports when Case Review transaction changes */
+  const loadIncidentHistory = async (incidentId) => {
+    if (!incidentId) {
+      setIncidentHistory(null);
+      setEvidenceReports([]);
+      return;
+    }
+    const [histRes, reports] = await Promise.all([
+      getIncidentHistory(incidentId),
+      getScribeReportsForIncident(incidentId)
+    ]);
+    setIncidentHistory(histRes.ok ? histRes.data : null);
+    setEvidenceReports(reports);
   };
 
   // Block/Unblock IP
@@ -749,14 +843,16 @@ const FraudLensAdminPanel = () => {
             iconAnchor: [8, 8]
           });
 
+          const payerBankMap = getBankFromVpa(t.payerVpa);
+          const receiverBankMap = getBankFromVpa(t.receiverVpa);
           const popupContent = `
             <div style="min-width: 200px;">
               <h4 style="margin: 0 0 8px 0; color: #1f2937;">Transaction Details</h4>
               <p style="margin: 4px 0;"><b>ID:</b> ${t.id.substring(0, 8)}...</p>
               <p style="margin: 4px 0;"><b>Amount:</b> ₹${t.amount?.toLocaleString()}</p>
               <p style="margin: 4px 0;"><b>Risk Level:</b> <span style="color: ${getSeverityColor(severity.level)};">${severity.level}</span></p>
-              <p style="margin: 4px 0;"><b>From:</b> ${t.payerVpa || payerUser.bankVPA || 'N/A'}</p>
-              <p style="margin: 4px 0;"><b>To:</b> ${t.receiverVpa || receiverUser.bankVPA || 'N/A'}</p>
+              <p style="margin: 4px 0;"><b>From:</b> ${t.payerVpa || payerUser.bankVPA || 'N/A'} <span style="background:${payerBankMap.color};color:white;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:600;margin-left:4px;">${payerBankMap.code}</span></p>
+              <p style="margin: 4px 0;"><b>To:</b> ${t.receiverVpa || receiverUser.bankVPA || 'N/A'} <span style="background:${receiverBankMap.color};color:white;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:600;margin-left:4px;">${receiverBankMap.code}</span></p>
               <p style="margin: 4px 0;"><b>Status:</b> ${t.status || 'PENDING'}</p>
               <p style="margin: 4px 0;"><b>Time:</b> ${t.timestamp.toLocaleString()}</p>
             </div>
@@ -1157,9 +1253,11 @@ const FraudLensAdminPanel = () => {
                     <div style={transactionDetailsStyle}>
                       <div>
                         <strong>From:</strong> {transaction.payerVpa || payerUser.bankVPA || 'N/A'}
+                        <span style={{ ...getBankBadgeStyle(getBankFromVpa(transaction.payerVpa)), marginLeft: 6 }}>{getBankFromVpa(transaction.payerVpa).code}</span>
                       </div>
                       <div>
                         <strong>To:</strong> {transaction.receiverVpa || receiverUser.bankVPA || 'N/A'}
+                        <span style={{ ...getBankBadgeStyle(getBankFromVpa(transaction.receiverVpa)), marginLeft: 6 }}>{getBankFromVpa(transaction.receiverVpa).code}</span>
                       </div>
                       <div>
                         <strong>Amount:</strong> ₹{transaction.amount?.toLocaleString() || 'N/A'}
@@ -1187,8 +1285,23 @@ const FraudLensAdminPanel = () => {
     );
   };
 
-  // Case Review Component (unchanged from original)
-  const CaseReview = ({ transaction }) => {
+  // Case Review Component
+  const CaseReview = ({
+    transaction,
+    onTransactionChange,
+    incidentHistory,
+    evidenceReports,
+    onConfirmFraudCommitLedger,
+    commitLedgerLoading,
+    commitLedgerError,
+    ledgerCommittedFor
+  }) => {
+    React.useEffect(() => {
+      if (transaction?.id && onTransactionChange) {
+        onTransactionChange(transaction.id);
+      }
+    }, [transaction?.id, onTransactionChange]);
+
     if (!transaction) {
       return (
         <div style={cardStyle}>
@@ -1202,6 +1315,15 @@ const FraudLensAdminPanel = () => {
     const severity = getFraudSeverity(transaction);
     const payerUser = getUserDetails(transaction.payerUserId);
     const receiverUser = getUserDetails(transaction.receiverUserId);
+    const payerBank = getBankFromVpa(transaction.payerVpa);
+    const receiverBank = getBankFromVpa(transaction.receiverVpa);
+    const detectionDate = transaction.timestamp;
+    let slaDeadline = null;
+    if (detectionDate) {
+      slaDeadline = new Date(detectionDate);
+      slaDeadline.setDate(slaDeadline.getDate() + 21);
+    }
+    const withinSLA = slaDeadline ? new Date() <= slaDeadline : null;
 
     return (
       <div style={cardStyle}>
@@ -1250,6 +1372,81 @@ const FraudLensAdminPanel = () => {
                 Report to NCRP
               </button>
             )}
+            {(transaction.status === 'blocked' || transaction.modelDecision) && (
+              <button
+                type="button"
+                onClick={() => onConfirmFraudCommitLedger?.(transaction)}
+                disabled={commitLedgerLoading || ledgerCommittedFor === transaction.id}
+                style={{
+                  ...buttonStyle,
+                  backgroundColor: ledgerCommittedFor === transaction.id ? '#059669' : '#0d9488',
+                  opacity: commitLedgerLoading ? 0.7 : 1
+                }}
+                title="Record immutable fraud decision on Chronos audit ledger for RBI"
+              >
+                {commitLedgerLoading ? (
+                  'Committing…'
+                ) : ledgerCommittedFor === transaction.id ? (
+                  '✓ Committed to Ledger'
+                ) : (
+                  'Confirm Fraud & Commit to Ledger'
+                )}
+              </button>
+            )}
+          </div>
+        </div>
+
+        {commitLedgerError && (
+          <div style={{ ...errorStyle, marginBottom: 16 }}>Ledger commit failed: {commitLedgerError}</div>
+        )}
+
+        {ledgerCommittedFor === transaction.id && (
+          <div style={{ padding: '12px 16px', backgroundColor: '#d1fae5', borderRadius: 8, marginBottom: 16, color: '#065f46', fontSize: 14 }}>
+            ✓ Immutable fraud decision recorded for RBI audit.
+          </div>
+        )}
+
+        <div style={infoSectionStyle}>
+          <h3 style={sectionTitleStyle}>Regulatory & Ledger Status</h3>
+          <div style={infoListStyle}>
+            <div style={infoItemStyle}>
+              <span>Detection date:</span>
+              <span>{detectionDate?.toLocaleString?.() || 'N/A'}</span>
+            </div>
+            <div style={infoItemStyle}>
+              <span>RBI SLA deadline (T+21):</span>
+              <span>{slaDeadline?.toLocaleDateString?.() || 'N/A'}</span>
+            </div>
+            <div style={infoItemStyle}>
+              <span>SLA status:</span>
+              <span>
+                {withinSLA === null ? (
+                  'N/A'
+                ) : withinSLA ? (
+                  <span style={{ color: '#059669', fontWeight: 600 }}>Within SLA</span>
+                ) : (
+                  <span style={{ color: '#dc2626', fontWeight: 600 }}>SLA breach</span>
+                )}
+              </span>
+            </div>
+            <div style={infoItemStyle}>
+              <span>Ledger status:</span>
+              <span>
+                {incidentHistory?.committedAt
+                  ? `Anchored to Chronos audit ledger (${new Date(incidentHistory.committedAt).toLocaleString()})`
+                  : ledgerCommittedFor === transaction.id
+                    ? 'Anchored to Chronos audit ledger'
+                    : 'Not yet committed'}
+              </span>
+            </div>
+            {(incidentHistory?.evidenceHash || incidentHistory?.reports?.[0]?.sha256) && (
+              <div style={infoItemStyle}>
+                <span>Evidence hash:</span>
+                <span style={{ fontFamily: 'monospace', fontSize: 12 }}>
+                  {incidentHistory.evidenceHash || incidentHistory.reports?.[0]?.sha256 || '—'}
+                </span>
+              </div>
+            )}
           </div>
         </div>
 
@@ -1267,7 +1464,10 @@ const FraudLensAdminPanel = () => {
                 </div>
                 <div style={infoItemStyle}>
                   <span>Payer VPA:</span>
-                  <span>{transaction.payerVpa || 'N/A'}</span>
+                  <span>
+                    {transaction.payerVpa || 'N/A'}
+                    <span style={{ ...getBankBadgeStyle(payerBank), marginLeft: 6 }}>{payerBank.code}</span>
+                  </span>
                 </div>
                 <div style={infoItemStyle}>
                   <span>Payer IFSC:</span>
@@ -1279,7 +1479,10 @@ const FraudLensAdminPanel = () => {
                 </div>
                 <div style={infoItemStyle}>
                   <span>Receiver VPA:</span>
-                  <span>{transaction.receiverVpa || 'N/A'}</span>
+                  <span>
+                    {transaction.receiverVpa || 'N/A'}
+                    <span style={{ ...getBankBadgeStyle(receiverBank), marginLeft: 6 }}>{receiverBank.code}</span>
+                  </span>
                 </div>
                 <div style={infoItemStyle}>
                   <span>Amount:</span>
@@ -1402,6 +1605,65 @@ const FraudLensAdminPanel = () => {
               </div>
             </div>
           </div>
+        </div>
+
+        <div style={{ ...infoSectionStyle, marginTop: 24 }}>
+          <h3 style={sectionTitleStyle}>
+            <Shield size={18} />
+            Evidence & Stakeholders
+          </h3>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 16 }}>
+            <div style={{ padding: 12, border: '1px solid #e5e7eb', borderRadius: 8, backgroundColor: '#f9fafb' }}>
+              <div style={{ fontWeight: 600, marginBottom: 8, color: '#374151' }}>RBI / Financial</div>
+              <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 8 }}>
+                UTR: {transaction.utr || 'N/A'} · VPA: {transaction.payerVpa || 'N/A'} · ₹{transaction.amount?.toLocaleString()}
+              </div>
+              <Link to={`/reports?incidentId=${transaction.id}`} style={{ ...primaryButtonStyle, display: 'inline-flex', fontSize: 12, padding: '6px 12px' }}>
+                Generate RBI Compliance Pack
+              </Link>
+            </div>
+            <div style={{ padding: 12, border: '1px solid #e5e7eb', borderRadius: 8, backgroundColor: '#f9fafb' }}>
+              <div style={{ fontWeight: 600, marginBottom: 8, color: '#374151' }}>CERT-In / Technical</div>
+              <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 8 }}>
+                IP: {transaction.ipData?.ipAddress || 'N/A'} · Device ID: {transaction.deviceId || 'N/A'}
+              </div>
+              <Link to={`/reports?incidentId=${transaction.id}`} style={{ ...primaryButtonStyle, display: 'inline-flex', fontSize: 12, padding: '6px 12px' }}>
+                Generate CERT-In Annex
+              </Link>
+            </div>
+            <div style={{ padding: 12, border: '1px solid #e5e7eb', borderRadius: 8, backgroundColor: '#f9fafb' }}>
+              <div style={{ fontWeight: 600, marginBottom: 8, color: '#374151' }}>Police / NCRP</div>
+              <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 8 }}>
+                Victim narrative available in NCRP report
+              </div>
+              <button type="button" onClick={() => openNCRPReportFlow(transaction)} style={{ ...primaryButtonStyle, display: 'inline-flex', fontSize: 12, padding: '6px 12px' }}>
+                Generate NCRP Legal Dossier
+              </button>
+            </div>
+          </div>
+          {evidenceReports && evidenceReports.length > 0 && (
+            <div style={{ marginTop: 16 }}>
+              <div style={{ fontWeight: 600, marginBottom: 8, color: '#374151' }}>Artifacts</div>
+              {evidenceReports.map((r, i) => (
+                <div key={i} style={{ fontSize: 13, padding: 8, backgroundColor: '#f3f4f6', borderRadius: 6, marginBottom: 6, display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
+                  <span><strong>{r.reportType || 'Report'}</strong> · {r.objectPath || '—'}</span>
+                  <span>
+                    <code style={{ fontSize: 11 }}>{r.sha256?.substring?.(0, 16)}…</code>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        const res = await verifyDocument(transaction.id, r.sha256);
+                        alert(res.ok ? 'Hash verified.' : (res.error || 'Verification failed.'));
+                      }}
+                      style={{ marginLeft: 8, ...buttonStyle, padding: '4px 8px', fontSize: 11, backgroundColor: '#374151' }}
+                    >
+                      Verify hash
+                    </button>
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       </div>
     );
@@ -1529,6 +1791,47 @@ const FraudLensAdminPanel = () => {
                 <Tooltip />
               </PieChart>
             </ResponsiveContainer>
+          </div>
+        </div>
+
+        {/* Compliance & Operational Risk */}
+        <div style={{ ...kpiGridStyle, marginTop: 8 }}>
+          <h3 style={{ ...chartTitleStyle, gridColumn: '1 / -1' }}>Compliance & Operational Risk</h3>
+          <div style={kpiCardStyle}>
+            <div style={kpiContentStyle}>
+              <div>
+                <p style={kpiLabelStyle}>Blocked Fraud (RBI 21-day window)</p>
+                <p style={kpiValueStyle}>
+                  {transactions.filter(t => t.status === 'blocked').filter(t => {
+                    if (!t.timestamp) return false;
+                    const d = new Date(t.timestamp);
+                    d.setDate(d.getDate() + 21);
+                    return new Date() <= d;
+                  }).length} / {transactions.filter(t => t.status === 'blocked').length}
+                </p>
+              </div>
+              <Shield size={24} color="#059669" />
+            </div>
+          </div>
+          <div style={kpiCardStyle}>
+            <div style={kpiContentStyle}>
+              <div>
+                <p style={kpiLabelStyle}>Blocked with Evidence</p>
+                <p style={kpiValueStyle}>
+                  {transactions.filter(t => t.status === 'blocked').length} incidents
+                </p>
+              </div>
+              <Database size={24} color="#3b82f6" />
+            </div>
+          </div>
+          <div style={kpiCardStyle}>
+            <div style={kpiContentStyle}>
+              <div>
+                <p style={kpiLabelStyle}>Chronos Ledger</p>
+                <p style={{ ...kpiValueStyle, fontSize: 14 }}>VM / Cloud Run</p>
+              </div>
+              <CheckCircle size={24} color="#10b981" />
+            </div>
           </div>
         </div>
 
@@ -1683,9 +1986,44 @@ const FraudLensAdminPanel = () => {
       {/* Main Content */}
       <main style={mainStyle}>
         {activeTab === 'alerts' && (
-          <div style={alertsLayoutStyle}>
+          <div>
+            {(() => {
+              const selectedBank = getBankPersonaFromUrl();
+              const consortiumIncoming = selectedBank
+                ? transactions.filter(
+                    t =>
+                      t.status === 'blocked' &&
+                      getBankFromVpa(t.receiverVpa).code === selectedBank &&
+                      getBankFromVpa(t.payerVpa).code !== selectedBank
+                  )
+                : [];
+              return consortiumIncoming.length > 0 ? (
+                <div style={consortiumBannerStyle}>
+                  <AlertTriangle size={20} />
+                  <div>
+                    <strong>Consortium Alert:</strong> Incoming funds from {consortiumIncoming.length} incident(s) flagged as FRAUD by sender bank(s). Accounts frozen via consortium policy.
+                    {consortiumIncoming.slice(0, 3).map(t => (
+                      <div key={t.id} style={{ marginTop: 4, fontSize: 13 }}>
+                        Incident #{t.id.substring(0, 8)}… — FRAUD by {getBankFromVpa(t.payerVpa).name}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : null;
+            })()}
+            <div style={alertsLayoutStyle}>
             <LiveAlertsFeed />
-            <CaseReview transaction={selectedTransaction} />
+            <CaseReview
+              transaction={selectedTransaction}
+              onTransactionChange={loadIncidentHistory}
+              incidentHistory={incidentHistory}
+              evidenceReports={evidenceReports}
+              onConfirmFraudCommitLedger={handleConfirmFraudAndCommitLedger}
+              commitLedgerLoading={commitLedgerLoading}
+              commitLedgerError={commitLedgerError}
+              ledgerCommittedFor={ledgerCommittedFor}
+            />
+            </div>
           </div>
         )}
         
@@ -1851,6 +2189,7 @@ const FraudLensAdminPanel = () => {
                           <span style={vpaLabelStyle}>From:</span>
                           <span style={vpaValueStyle}>
                             {transaction.payerVpa || payerUser.bankVPA || 'N/A'}
+                            <span style={{ ...getBankBadgeStyle(getBankFromVpa(transaction.payerVpa)), marginLeft: 6 }}>{getBankFromVpa(transaction.payerVpa).code}</span>
                           </span>
                         </div>
                         <div style={vpaArrowStyle}>→</div>
@@ -1858,6 +2197,7 @@ const FraudLensAdminPanel = () => {
                           <span style={vpaLabelStyle}>To:</span>
                           <span style={vpaValueStyle}>
                             {transaction.receiverVpa || receiverUser.bankVPA || 'N/A'}
+                            <span style={{ ...getBankBadgeStyle(getBankFromVpa(transaction.receiverVpa)), marginLeft: 6 }}>{getBankFromVpa(transaction.receiverVpa).code}</span>
                           </span>
                         </div>
                       </div>
@@ -2804,6 +3144,18 @@ const primaryButtonStyle = {
 
 const thCellStyle = { padding: '12px 16px', fontWeight: 600, color: '#374151' };
 const tdCellStyle = { padding: '12px 16px' };
+
+const consortiumBannerStyle = {
+  display: 'flex',
+  alignItems: 'flex-start',
+  gap: 12,
+  padding: 16,
+  marginBottom: 16,
+  backgroundColor: '#fef3c7',
+  border: '1px solid #f59e0b',
+  borderRadius: 8,
+  color: '#92400e'
+};
 
 const demoBannerStyle = {
   backgroundColor: '#fef3c7',
