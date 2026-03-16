@@ -105,19 +105,23 @@ export async function verifyDocument(incidentId, sha256) {
 
   try {
     const params = new URLSearchParams({ incidentId, sha256 });
-    const url = `${base.replace(/\/$/, '')}/api/docs/verify-doc?${params.toString()}`;
-    const res = await fetch(url);
-    const data = await res.json().catch(() => ({}));
+    const baseUrl = base.replace(/\/$/, '');
+    const tryUrls = [
+      `${baseUrl}/api/chronos/verify-doc?${params.toString()}`,
+      `${baseUrl}/api/docs/verify-doc?${params.toString()}`
+    ];
 
-    if (!res.ok) {
-      return {
-        ok: false,
-        error: data?.message || data?.error || `HTTP ${res.status}`,
-        data: null
-      };
+    let lastErr = null;
+    for (const url of tryUrls) {
+      const res = await fetch(url);
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) return { ok: true, data };
+      lastErr = data?.message || data?.error || `HTTP ${res.status}`;
+      // If it's a 404, try the next legacy URL.
+      if (res.status !== 404) break;
     }
 
-    return { ok: true, data };
+    return { ok: false, error: lastErr || 'Verification failed', data: null };
   } catch (err) {
     return {
       ok: false,

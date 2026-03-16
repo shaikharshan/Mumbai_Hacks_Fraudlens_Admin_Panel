@@ -180,7 +180,9 @@ const ScribeDashboard = () => {
 
   const handleViewStoredCopy = async () => {
     try {
-      const base = process.env.REACT_APP_CHRONOS_API?.trim();
+      const vm = process.env.REACT_APP_CHRONOS_API_URL?.trim();
+      const cloudRun = process.env.REACT_APP_CHRONOS_API?.trim();
+      const base = vm || cloudRun;
       const objectPath = currentReportMeta?.gcsObjectPath;
       if (!base || !objectPath) {
         alert('No stored copy available yet.');

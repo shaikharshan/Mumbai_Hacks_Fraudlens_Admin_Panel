@@ -59,7 +59,6 @@ const FraudLensAdminPanel = () => {
   const [approveRole, setApproveRole] = useState({});
   const [ncrpModalOpen, setNcrpModalOpen] = useState(false);
   const [ncrpReportTransaction, setNcrpReportTransaction] = useState(null);
-  const [scribeAutoPromptTransactionId, setScribeAutoPromptTransactionId] = useState(null);
   const [scribeAutoGenerating, setScribeAutoGenerating] = useState(false);
   const [scribeAutoDoneCount, setScribeAutoDoneCount] = useState(null);
   const [scribeAutoDoneReports, setScribeAutoDoneReports] = useState(null);
@@ -482,18 +481,48 @@ const FraudLensAdminPanel = () => {
           console.log('💰 Balance updates completed successfully');
         }
 
-        // Chronos ledger commit (non-blocking; user can retry via Confirm Fraud button)
-        const payerBank = getBankFromVpa(transaction.payerVpa);
-        const ledgerResult = await commitFraudDecision(
-          transactionId,
-          'FRAUD_CONFIRMED',
-          'ADMIN_BLOCKED',
-          [],
-          profile?.email || 'admin',
-          payerBank.code
-        );
-        if (!ledgerResult.ok) {
-          console.warn('Chronos ledger commit failed:', ledgerResult.error);
+        // Auto-generate RBI + CERT-In + Exec reports via Gemini, upload to GCS, then commit hashes to ledger.
+        // This replaces the old "navigate to Scribe demo page" flow.
+        setScribeAutoGenerating(true);
+        setScribeAutoError(null);
+        try {
+          const results = await generateRequiredReportsForIncident(db, transactionId);
+          setScribeAutoDoneCount(results.length);
+          setScribeAutoDoneReports(results);
+          setScribeAutoDoneIncidentId(transactionId);
+
+          const reportsForLedger = (results || [])
+            .map((r) => ({
+              objectPath: r?.gcs?.objectPath,
+              sha256: r?.gcs?.sha256,
+              reportType: r?.reportType
+            }))
+            .filter((r) => r.objectPath && r.sha256);
+
+          // Commit decision + evidence hashes to Chronos ledger (Hyperledger-backed on VM).
+          const payerBank = getBankFromVpa(transaction.payerVpa);
+          const ledgerResult = await commitFraudDecision(
+            transactionId,
+            'FRAUD_CONFIRMED',
+            'AUTO_REPORTS_GENERATED',
+            reportsForLedger,
+            profile?.email || 'admin',
+            payerBank.code
+          );
+          if (!ledgerResult.ok) {
+            console.warn('Chronos ledger commit failed:', ledgerResult.error);
+          } else {
+            setLedgerCommittedFor(transactionId);
+            // Refresh ledger history + evidence list for UI persistence across reloads.
+            const hist = await getIncidentHistory(transactionId);
+            if (hist.ok && hist.data) setIncidentHistory(hist.data);
+            if (reportsForLedger.length > 0) setEvidenceReports(reportsForLedger);
+          }
+        } catch (err) {
+          console.error('Auto-generate + ledger commit failed', err);
+          setScribeAutoError(err.message || 'Failed to generate reports.');
+        } finally {
+          setScribeAutoGenerating(false);
         }
       }
       
@@ -506,13 +535,7 @@ const FraudLensAdminPanel = () => {
         setSelectedTransaction(prev => ({ ...prev, status: status.toLowerCase() }));
       }
 
-      if (status.toLowerCase() === 'blocked') {
-        setScribeAutoDoneCount(null);
-        setScribeAutoDoneReports(null);
-        setScribeAutoDoneIncidentId(null);
-        setScribeAutoError(null);
-        setScribeAutoPromptTransactionId(transactionId);
-      } else {
+      if (status.toLowerCase() !== 'blocked') {
         alert(`✅ Transaction ${status} successfully!${status.toLowerCase() === 'approved' ? ' Balances updated.' : ''}`);
       }
     } catch (error) {
@@ -521,31 +544,7 @@ const FraudLensAdminPanel = () => {
     }
   };
 
-  const handleScribeAutoGenerate = async () => {
-    if (!scribeAutoPromptTransactionId) return;
-    setScribeAutoGenerating(true);
-    setScribeAutoError(null);
-    try {
-      const results = await generateRequiredReportsForIncident(db, scribeAutoPromptTransactionId);
-      setScribeAutoDoneCount(results.length);
-      setScribeAutoDoneReports(results);
-      setScribeAutoDoneIncidentId(scribeAutoPromptTransactionId);
-      setScribeAutoPromptTransactionId(null);
-    } catch (err) {
-      console.error('Scribe auto-generate failed', err);
-      setScribeAutoError(err.message || 'Failed to generate reports.');
-    } finally {
-      setScribeAutoGenerating(false);
-    }
-  };
-
-  const dismissScribeAutoPrompt = () => {
-    setScribeAutoPromptTransactionId(null);
-    setScribeAutoError(null);
-    if (!scribeAutoGenerating) {
-      alert('✅ Transaction blocked successfully!');
-    }
-  };
+  // Legacy Scribe modal flow removed: blocking triggers automatic Gemini → GCS → Ledger pipeline.
 
   /** Fetch Scribe reports for an incident (objectPath, sha256, reportType) for Chronos commit */
   const getScribeReportsForIncident = async (incidentId) => {
@@ -580,7 +579,18 @@ const FraudLensAdminPanel = () => {
     setCommitLedgerLoading(true);
     setCommitLedgerError(null);
     try {
-      const reports = await getScribeReportsForIncident(transaction.id);
+      let reports = await getScribeReportsForIncident(transaction.id);
+      // If there are no uploaded artifacts yet, generate them now automatically.
+      if (!reports || reports.length === 0) {
+        const results = await generateRequiredReportsForIncident(db, transaction.id);
+        reports = (results || [])
+          .map((r) => ({
+            objectPath: r?.gcs?.objectPath,
+            sha256: r?.gcs?.sha256,
+            reportType: r?.reportType
+          }))
+          .filter((r) => r.objectPath && r.sha256);
+      }
       const payerBank = getBankFromVpa(transaction.payerVpa);
       const result = await commitFraudDecision(
         transaction.id,
@@ -595,6 +605,7 @@ const FraudLensAdminPanel = () => {
         setIncidentHistory(prev => prev?.incidentId === transaction.id ? null : prev);
         const hist = await getIncidentHistory(transaction.id);
         if (hist.ok && hist.data) setIncidentHistory(hist.data);
+        setEvidenceReports(Array.isArray(reports) ? reports : []);
       } else {
         setCommitLedgerError(result.error || 'Ledger commit failed');
       }
@@ -616,8 +627,30 @@ const FraudLensAdminPanel = () => {
       getIncidentHistory(incidentId),
       getScribeReportsForIncident(incidentId)
     ]);
-    setIncidentHistory(histRes.ok ? histRes.data : null);
-    setEvidenceReports(reports);
+    const hist = histRes.ok ? histRes.data : null;
+    setIncidentHistory(hist);
+
+    if (Array.isArray(reports) && reports.length > 0) {
+      setEvidenceReports(reports);
+      return;
+    }
+
+    // Fallback: use ledger-committed reports if Firestore doesn't have uploaded artifacts.
+    const ledgerReports = [];
+    const events = hist?.events;
+    if (Array.isArray(events)) {
+      for (const e of events) {
+        const rep = e?.reports;
+        if (Array.isArray(rep)) {
+          for (const r of rep) {
+            if (r?.objectPath && r?.sha256) {
+              ledgerReports.push({ objectPath: r.objectPath, sha256: r.sha256, reportType: r.reportType });
+            }
+          }
+        }
+      }
+    }
+    setEvidenceReports(ledgerReports);
   };
 
   // Block/Unblock IP
@@ -1432,18 +1465,22 @@ const FraudLensAdminPanel = () => {
             <div style={infoItemStyle}>
               <span>Ledger status:</span>
               <span>
-                {incidentHistory?.committedAt
-                  ? `Anchored to Chronos audit ledger (${new Date(incidentHistory.committedAt).toLocaleString()})`
-                  : ledgerCommittedFor === transaction.id
-                    ? 'Anchored to Chronos audit ledger'
-                    : 'Not yet committed'}
+                {(() => {
+                  const hasEvents = Array.isArray(incidentHistory?.events) && incidentHistory.events.length > 0;
+                  const commitTs = incidentHistory?.events?.[0]?.timestamp;
+                  if (hasEvents) {
+                    return `Anchored to Chronos audit ledger${commitTs ? ` (${new Date(commitTs).toLocaleString()})` : ''}`;
+                  }
+                  if (ledgerCommittedFor === transaction.id) return 'Anchored to Chronos audit ledger';
+                  return 'Not yet committed';
+                })()}
               </span>
             </div>
-            {(incidentHistory?.evidenceHash || incidentHistory?.reports?.[0]?.sha256) && (
+            {(incidentHistory?.events?.[0]?.reports?.[0]?.sha256 || incidentHistory?.evidenceHash || incidentHistory?.reports?.[0]?.sha256) && (
               <div style={infoItemStyle}>
                 <span>Evidence hash:</span>
                 <span style={{ fontFamily: 'monospace', fontSize: 12 }}>
-                  {incidentHistory.evidenceHash || incidentHistory.reports?.[0]?.sha256 || '—'}
+                  {incidentHistory?.events?.[0]?.reports?.[0]?.sha256 || incidentHistory?.evidenceHash || incidentHistory?.reports?.[0]?.sha256 || '—'}
                 </span>
               </div>
             )}
@@ -1618,18 +1655,26 @@ const FraudLensAdminPanel = () => {
               <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 8 }}>
                 UTR: {transaction.utr || 'N/A'} · VPA: {transaction.payerVpa || 'N/A'} · ₹{transaction.amount?.toLocaleString()}
               </div>
-              <Link to={`/reports?incidentId=${transaction.id}`} style={{ ...primaryButtonStyle, display: 'inline-flex', fontSize: 12, padding: '6px 12px' }}>
-                Generate RBI Compliance Pack
-              </Link>
+              <button
+                type="button"
+                onClick={() => handleConfirmFraudAndCommitLedger(transaction)}
+                style={{ ...primaryButtonStyle, display: 'inline-flex', fontSize: 12, padding: '6px 12px' }}
+              >
+                Generate & Anchor Evidence Pack
+              </button>
             </div>
             <div style={{ padding: 12, border: '1px solid #e5e7eb', borderRadius: 8, backgroundColor: '#f9fafb' }}>
               <div style={{ fontWeight: 600, marginBottom: 8, color: '#374151' }}>CERT-In / Technical</div>
               <div style={{ fontSize: 13, color: '#6b7280', marginBottom: 8 }}>
                 IP: {transaction.ipData?.ipAddress || 'N/A'} · Device ID: {transaction.deviceId || 'N/A'}
               </div>
-              <Link to={`/reports?incidentId=${transaction.id}`} style={{ ...primaryButtonStyle, display: 'inline-flex', fontSize: 12, padding: '6px 12px' }}>
-                Generate CERT-In Annex
-              </Link>
+              <button
+                type="button"
+                onClick={() => handleConfirmFraudAndCommitLedger(transaction)}
+                style={{ ...primaryButtonStyle, display: 'inline-flex', fontSize: 12, padding: '6px 12px' }}
+              >
+                Generate & Anchor Evidence Pack
+              </button>
             </div>
             <div style={{ padding: 12, border: '1px solid #e5e7eb', borderRadius: 8, backgroundColor: '#f9fafb' }}>
               <div style={{ fontWeight: 600, marginBottom: 8, color: '#374151' }}>Police / NCRP</div>
@@ -2290,56 +2335,10 @@ const FraudLensAdminPanel = () => {
         </div>
       )}
 
-      {scribeAutoPromptTransactionId && (
-        <div style={ncrpModalBackdropStyle} onClick={dismissScribeAutoPrompt}>
-          <div style={ncrpModalContentStyle} onClick={(e) => e.stopPropagation()}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-              <h3 style={{ margin: 0, fontSize: 18, color: '#1f2937', display: 'flex', alignItems: 'center', gap: 8 }}>
-                <FileWarning size={22} color="#059669" />
-                Generate compliance reports (Scribe)
-              </h3>
-              {!scribeAutoGenerating && (
-                <button type="button" onClick={dismissScribeAutoPrompt} style={{ ...iconButtonStyle, fontSize: 24, lineHeight: 1 }} aria-label="Close">×</button>
-              )}
-            </div>
-            <p style={{ fontSize: 14, color: '#374151', margin: '0 0 12px 0' }}>
-              Transaction blocked. Create the required reports for this incident so they can be sent to the concerned authorities (IT/Compliance, Leadership)?
-            </p>
-            <p style={{ fontSize: 13, color: '#6b7280', margin: '0 0 16px 0' }}>
-              Will generate: <strong>RBI Fraud Report</strong>, <strong>CERT-In Incident Report</strong>, <strong>Executive Summary</strong>. You can then open Scribe to send them to the right recipients.
-            </p>
-            {scribeAutoError && (
-              <p style={{ fontSize: 13, color: '#dc2626', margin: '0 0 12px 0' }}>{scribeAutoError}</p>
-            )}
-            <div style={{ display: 'flex', gap: 12, marginTop: 16, flexWrap: 'wrap' }}>
-              <button
-                type="button"
-                onClick={handleScribeAutoGenerate}
-                disabled={scribeAutoGenerating}
-                style={{ ...primaryButtonStyle, display: 'flex', alignItems: 'center', gap: 8, opacity: scribeAutoGenerating ? 0.7 : 1 }}
-              >
-                {scribeAutoGenerating ? 'Generating reports…' : 'Generate reports'}
-              </button>
-              <button type="button" onClick={dismissScribeAutoPrompt} disabled={scribeAutoGenerating} style={{ ...buttonStyle, backgroundColor: '#e5e7eb', color: '#374151' }}>
-                Skip
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
       {scribeAutoDoneCount != null && (
         <div style={{ position: 'fixed', bottom: 24, left: '50%', transform: 'translateX(-50%)', zIndex: 9999, background: '#059669', color: 'white', padding: '12px 20px', borderRadius: 8, boxShadow: '0 4px 12px rgba(0,0,0,0.15)', display: 'flex', alignItems: 'center', gap: 12 }}>
           <CheckCircle size={20} />
-          <span>{scribeAutoDoneCount} reports generated. Open Scribe to send to authorities.</span>
-          <Link
-            to={`/reports?reportIds=${encodeURIComponent(
-              (scribeAutoDoneReports || []).map(r => r.reportId).filter(Boolean).join(',')
-            )}&incidentId=${encodeURIComponent(scribeAutoDoneIncidentId || '')}`}
-            style={{ color: 'white', fontWeight: 600, textDecoration: 'underline' }}
-          >
-            Open latest reports
-          </Link>
+          <span>{scribeAutoDoneCount} reports generated and uploaded. Evidence anchored for audit.</span>
           <button
             type="button"
             onClick={() => {
