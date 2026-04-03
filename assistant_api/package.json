@@ -1,0 +1,19 @@
+{
+  "name": "fraudlens-assistant-api",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@google-cloud/bigquery": "^8.0.0",
+    "@google-cloud/vertexai": "^1.10.0",
+    "cors": "^2.8.6",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "google-auth-library": "^10.2.0",
+    "jose": "^6.1.0"
+  }
+}
+
