@@ -12,7 +12,8 @@ import {
   Timestamp,
   getDoc,
   increment,
-  where
+  where,
+  arrayUnion
 } from 'firebase/firestore';
 import { 
   AlertTriangle, 
@@ -56,6 +57,32 @@ import FraudApiPlayground from './pages/FraudApiPlayground';
 // const db = {};
 
 const FraudLensAdminPanel = () => {
+  const INCIDENT_STATUSES = [
+    'OPENED_BY_USER',
+    'UNDER_REVIEW',
+    'ESCALATED',
+    'RESOLVED_USER_COMPENSATED',
+    'RESOLVED_BANK_NOT_LIABLE',
+    'CLOSED_DUPLICATE',
+    'CLOSED_INVALID'
+  ];
+  const IN_PROGRESS_INCIDENT_STATUSES = new Set(['UNDER_REVIEW', 'ESCALATED']);
+  const CLOSED_INCIDENT_STATUSES = new Set([
+    'RESOLVED_USER_COMPENSATED',
+    'RESOLVED_BANK_NOT_LIABLE',
+    'CLOSED_DUPLICATE',
+    'CLOSED_INVALID'
+  ]);
+  const INCIDENT_STATUS_LABELS = {
+    OPENED_BY_USER: 'Opened by user',
+    UNDER_REVIEW: 'Under review',
+    ESCALATED: 'Escalated',
+    RESOLVED_USER_COMPENSATED: 'Resolved: user compensated',
+    RESOLVED_BANK_NOT_LIABLE: 'Resolved: bank not liable',
+    CLOSED_DUPLICATE: 'Closed: duplicate',
+    CLOSED_INVALID: 'Closed: invalid'
+  };
+
   const { profile, signOut, isIT, adminUsersCollection, isDemo } = useAuth();
   const [activeTab, setActiveTab] = useState('alerts');
   const [pendingUsers, setPendingUsers] = useState([]);
@@ -142,6 +169,13 @@ const FraudLensAdminPanel = () => {
   const [transactions, setTransactions] = useState([]);
   const [selectedTransaction, setSelectedTransaction] = useState(null);
   const [users, setUsers] = useState([]);
+  const [incidents, setIncidents] = useState([]);
+  const [incidentFilter, setIncidentFilter] = useState('inbox');
+  const [selectedIncidentId, setSelectedIncidentId] = useState(null);
+  const [incidentDraft, setIncidentDraft] = useState(null);
+  const [incidentsLoading, setIncidentsLoading] = useState(true);
+  const [incidentsError, setIncidentsError] = useState(null);
+  const [incidentSaving, setIncidentSaving] = useState(false);
   const [ipLogs, setIpLogs] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -388,6 +422,67 @@ const FraudLensAdminPanel = () => {
     };
   }, []);
 
+  useEffect(() => {
+    if (!process.env.REACT_APP_FIREBASE_PROJECT_ID) {
+      setIncidentsLoading(false);
+      return;
+    }
+
+    const incidentsQuery = query(
+      collection(db, 'user_incidents'),
+      orderBy('createdAt', 'desc'),
+      limit(300)
+    );
+
+    const unsubscribe = onSnapshot(
+      incidentsQuery,
+      (snapshot) => {
+        const incidentData = snapshot.docs.map((docSnapshot) => {
+          const data = docSnapshot.data() || {};
+          return {
+            id: docSnapshot.id,
+            incidentId: data.incidentId || docSnapshot.id,
+            transactionId: data.transactionId || null,
+            userId: data.userId || null,
+            createdAt: data.createdAt || null,
+            updatedAt: data.updatedAt || null,
+            status: data.status || 'OPENED_BY_USER',
+            userReason: data.userReason || 'Not specified',
+            userDescription: data.userDescription || '',
+            userAttachments: Array.isArray(data.userAttachments) ? data.userAttachments : [],
+            timeline: Array.isArray(data.timeline) ? data.timeline : [],
+            adminNotes: data.adminNotes || '',
+            fraudCategory: data.fraudCategory || '',
+            actionTaken: data.actionTaken || '',
+            reportedToI4C: Boolean(data.reportedToI4C),
+            i4cDocId: data.i4cDocId || ''
+          };
+        });
+
+        setIncidents(incidentData);
+        setIncidentsError(null);
+        setIncidentsLoading(false);
+
+        setSelectedIncidentId((prevId) => {
+          if (!incidentData.length) {
+            return null;
+          }
+          if (prevId && incidentData.some((item) => item.id === prevId)) {
+            return prevId;
+          }
+          return incidentData[0].id;
+        });
+      },
+      (err) => {
+        console.error('❌ Error loading incidents:', err);
+        setIncidentsError('Failed to load incidents: ' + (err?.message || 'Unknown error'));
+        setIncidentsLoading(false);
+      }
+    );
+
+    return () => unsubscribe();
+  }, []);
+
   // Calculate analytics from real data
   useEffect(() => {
     if (transactions.length > 0) {
@@ -413,6 +508,44 @@ const FraudLensAdminPanel = () => {
       });
     }
   }, [transactions, users, ipLogs]);
+
+  const selectedIncident = incidents.find((incident) => incident.id === selectedIncidentId) || null;
+  const incidentsInboxCount = incidents.filter((incident) => incident.status === 'OPENED_BY_USER').length;
+  const incidentsInProgressCount = incidents.filter((incident) => IN_PROGRESS_INCIDENT_STATUSES.has(incident.status)).length;
+  const incidentsClosedCount = incidents.filter((incident) => CLOSED_INCIDENT_STATUSES.has(incident.status)).length;
+
+  const getIncidentStatusColor = (status) => {
+    if (status === 'OPENED_BY_USER') return '#f59e0b';
+    if (status === 'UNDER_REVIEW') return '#2563eb';
+    if (status === 'ESCALATED') return '#7c3aed';
+    if (CLOSED_INCIDENT_STATUSES.has(status)) return '#10b981';
+    return '#6b7280';
+  };
+
+  const getIncidentStatusLabel = (status) => INCIDENT_STATUS_LABELS[status] || status || 'Unknown';
+
+  const getIncidentUser = (incident) =>
+    users.find((user) => user.id === incident.userId || user.userId === incident.userId) || null;
+
+  const getIncidentTransaction = (incident) =>
+    transactions.find((txn) => txn.id === incident.transactionId) || null;
+
+  useEffect(() => {
+    if (!selectedIncident) {
+      setIncidentDraft(null);
+      return;
+    }
+
+    setIncidentDraft({
+      status: selectedIncident.status || 'OPENED_BY_USER',
+      adminNotes: selectedIncident.adminNotes || '',
+      fraudCategory: selectedIncident.fraudCategory || '',
+      actionTaken: selectedIncident.actionTaken || '',
+      reportedToI4C: Boolean(selectedIncident.reportedToI4C),
+      i4cDocId: selectedIncident.i4cDocId || '',
+      adminMessage: ''
+    });
+  }, [selectedIncidentId, selectedIncident]);
 
   // Get fraud severity based on your schema
   const getFraudSeverity = (transaction) => {
@@ -692,6 +825,152 @@ const FraudLensAdminPanel = () => {
       }
     }
     setEvidenceReports(ledgerReports);
+  };
+
+  const getFilteredIncidents = () => {
+    if (incidentFilter === 'in-progress') {
+      return incidents.filter((incident) => IN_PROGRESS_INCIDENT_STATUSES.has(incident.status));
+    }
+    if (incidentFilter === 'closed') {
+      return incidents.filter((incident) => CLOSED_INCIDENT_STATUSES.has(incident.status));
+    }
+    return incidents.filter((incident) => incident.status === 'OPENED_BY_USER');
+  };
+
+  const openIncidentTransaction = async (incident) => {
+    if (!incident?.transactionId) {
+      alert('No transaction ID linked to this incident.');
+      return;
+    }
+
+    let linkedTransaction = transactions.find((txn) => txn.id === incident.transactionId);
+    if (!linkedTransaction) {
+      try {
+        const transactionRef = doc(db, 'transactions', incident.transactionId);
+        const transactionDoc = await getDoc(transactionRef);
+        if (!transactionDoc.exists()) {
+          alert('Transaction not found in Firestore.');
+          return;
+        }
+
+        const data = transactionDoc.data();
+        linkedTransaction = {
+          id: transactionDoc.id,
+          ...data,
+          timestamp: data.timestamp?.toDate ? data.timestamp.toDate() : new Date()
+        };
+
+        if (data.locationLogId) {
+          const locationDoc = await getDoc(doc(db, 'location_logs', data.locationLogId));
+          if (locationDoc.exists()) {
+            linkedTransaction.locationData = locationDoc.data();
+          }
+        }
+
+        if (data.ipLogId) {
+          const ipDoc = await getDoc(doc(db, 'ip_logs', data.ipLogId));
+          if (ipDoc.exists()) {
+            linkedTransaction.ipData = { id: data.ipLogId, ...ipDoc.data() };
+          }
+        }
+      } catch (err) {
+        console.error('Failed to load linked transaction', err);
+        alert('Failed to open linked transaction: ' + (err?.message || 'Unknown error'));
+        return;
+      }
+    }
+
+    setSelectedTransaction(linkedTransaction);
+    setActiveTab('alerts');
+  };
+
+  const saveIncidentUpdates = async () => {
+    if (!selectedIncident || !incidentDraft) {
+      return;
+    }
+
+    const nowIso = new Date().toISOString();
+    const adminIdentity = profile?.uid || profile?.email || profile?.displayName || 'admin';
+    const timelineEvents = [];
+    const statusChanged = selectedIncident.status !== incidentDraft.status;
+
+    if (statusChanged) {
+      timelineEvents.push({
+        eventId: crypto.randomUUID(),
+        incidentId: selectedIncident.incidentId || selectedIncident.id,
+        type: 'STATUS_CHANGED',
+        createdAt: nowIso,
+        message: `Status changed from ${getIncidentStatusLabel(selectedIncident.status)} to ${getIncidentStatusLabel(incidentDraft.status)}`,
+        byAdminId: adminIdentity,
+        byUserId: null,
+        meta: {
+          previousStatus: selectedIncident.status,
+          newStatus: incidentDraft.status
+        }
+      });
+    }
+
+    const adminMessage = incidentDraft.adminMessage?.trim();
+    if (adminMessage) {
+      timelineEvents.push({
+        eventId: crypto.randomUUID(),
+        incidentId: selectedIncident.incidentId || selectedIncident.id,
+        type: 'ADMIN_MESSAGE',
+        createdAt: nowIso,
+        message: adminMessage,
+        byAdminId: adminIdentity,
+        byUserId: null,
+        meta: {}
+      });
+    }
+
+    if (!selectedIncident.reportedToI4C && incidentDraft.reportedToI4C) {
+      timelineEvents.push({
+        eventId: crypto.randomUUID(),
+        incidentId: selectedIncident.incidentId || selectedIncident.id,
+        type: 'I4C_REPORTED',
+        createdAt: nowIso,
+        message: incidentDraft.i4cDocId?.trim()
+          ? `Reported to I4C (Doc ID: ${incidentDraft.i4cDocId.trim()})`
+          : 'Reported to I4C',
+        byAdminId: adminIdentity,
+        byUserId: null,
+        meta: {
+          i4cDocId: incidentDraft.i4cDocId?.trim() || null
+        }
+      });
+    }
+
+    const payload = {
+      status: incidentDraft.status,
+      adminNotes: incidentDraft.adminNotes.trim() || null,
+      fraudCategory: incidentDraft.fraudCategory.trim() || null,
+      actionTaken: incidentDraft.actionTaken.trim() || null,
+      reportedToI4C: Boolean(incidentDraft.reportedToI4C),
+      i4cDocId: incidentDraft.i4cDocId.trim() || null,
+      updatedAt: nowIso
+    };
+
+    setIncidentSaving(true);
+    try {
+      const incidentRef = doc(db, 'user_incidents', selectedIncident.id);
+      if (timelineEvents.length > 0) {
+        await updateDoc(incidentRef, {
+          ...payload,
+          timeline: arrayUnion(...timelineEvents)
+        });
+      } else {
+        await updateDoc(incidentRef, payload);
+      }
+
+      setIncidentDraft((prev) => (prev ? { ...prev, adminMessage: '' } : prev));
+      alert('Incident updated successfully.');
+    } catch (err) {
+      console.error('Failed to update incident', err);
+      alert('Failed to update incident: ' + (err?.message || 'Unknown error'));
+    } finally {
+      setIncidentSaving(false);
+    }
   };
 
   // Block/Unblock IP
@@ -1843,6 +2122,277 @@ const FraudLensAdminPanel = () => {
     );
   };
 
+  const IncidentsPanel = () => {
+    const filteredIncidents = getFilteredIncidents();
+
+    return (
+      <div style={cardStyle}>
+        <div style={cardHeaderStyle}>
+          <h2 style={cardTitleStyle}>
+            <FileWarning size={20} color="#dc2626" />
+            User Incidents ({filteredIncidents.length})
+          </h2>
+          <div style={incidentFilterTabsStyle}>
+            {[
+              { id: 'inbox', label: `Inbox (${incidentsInboxCount})` },
+              { id: 'in-progress', label: `In progress (${incidentsInProgressCount})` },
+              { id: 'closed', label: `Closed (${incidentsClosedCount})` }
+            ].map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => setIncidentFilter(item.id)}
+                style={{
+                  ...incidentFilterButtonStyle,
+                  ...(incidentFilter === item.id ? incidentFilterButtonActiveStyle : {})
+                }}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {incidentsError && (
+          <div style={{ ...errorStyle, marginBottom: 16 }}>
+            {incidentsError}
+          </div>
+        )}
+
+        {incidentsLoading ? (
+          <div style={emptyStateStyle}>
+            <p>Loading incidents...</p>
+          </div>
+        ) : (
+          <div style={incidentsLayoutStyle}>
+            <div style={incidentListStyle}>
+              {filteredIncidents.length === 0 ? (
+                <div style={emptyStateStyle}>
+                  <p>No incidents in this queue.</p>
+                </div>
+              ) : (
+                filteredIncidents.map((incident) => {
+                  const reporter = getIncidentUser(incident);
+                  const linkedTxn = getIncidentTransaction(incident);
+                  const isSelected = selectedIncident?.id === incident.id;
+                  return (
+                    <div
+                      key={incident.id}
+                      style={{
+                        ...incidentCardStyle,
+                        ...(isSelected ? incidentCardActiveStyle : {})
+                      }}
+                      onClick={() => setSelectedIncidentId(incident.id)}
+                    >
+                      <div style={incidentCardTopStyle}>
+                        <span style={{ ...incidentStatusPillStyle, backgroundColor: getIncidentStatusColor(incident.status) }}>
+                          {getIncidentStatusLabel(incident.status)}
+                        </span>
+                        <span style={timestampStyle}>{incident.createdAt || 'N/A'}</span>
+                      </div>
+                      <div style={incidentCardBodyStyle}>
+                        <div><strong>User VPA:</strong> {reporter?.bankVPA || 'N/A'}</div>
+                        <div><strong>Amount:</strong> ₹{linkedTxn?.amount?.toLocaleString?.() || 'N/A'}</div>
+                        <div><strong>Reason:</strong> {incident.userReason || 'N/A'}</div>
+                        {incident.userDescription && (
+                          <div style={incidentDescriptionSnippetStyle}>
+                            {incident.userDescription}
+                          </div>
+                        )}
+                        <div style={incidentRiskSignalsStyle}>
+                          <span>IP: {linkedTxn?.ipRiskScore != null ? `${(Number(linkedTxn.ipRiskScore) * 100).toFixed(1)}%` : 'N/A'}</span>
+                          <span>Location: {linkedTxn?.locationRiskScore != null ? `${(Number(linkedTxn.locationRiskScore) * 100).toFixed(1)}%` : 'N/A'}</span>
+                          <span>Model: {linkedTxn?.modelDecision ? 'FRAUD' : linkedTxn?.modelDecision === false ? 'SAFE' : 'N/A'} ({linkedTxn?.fraudScore != null ? `${(Number(linkedTxn.fraudScore) * 100).toFixed(1)}%` : 'N/A'})</span>
+                        </div>
+                      </div>
+                      <div style={incidentCardActionsStyle}>
+                        <button
+                          type="button"
+                          style={primaryButtonStyle}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            openIncidentTransaction(incident);
+                          }}
+                        >
+                          <ExternalLink size={14} />
+                          Open transaction
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+
+            <div style={incidentDetailStyle}>
+              {!selectedIncident || !incidentDraft ? (
+                <div style={emptyReviewStyle}>
+                  <p>Select an incident to review.</p>
+                </div>
+              ) : (
+                <>
+                  <div style={reviewHeaderStyle}>
+                    <div>
+                      <h2 style={{ margin: 0, color: '#1f2937' }}>Incident Details</h2>
+                      <div style={reviewInfoStyle}>
+                        <span style={{ ...incidentStatusPillStyle, backgroundColor: getIncidentStatusColor(selectedIncident.status) }}>
+                          {getIncidentStatusLabel(selectedIncident.status)}
+                        </span>
+                        <span style={transactionIdStyle}>Incident ID: {selectedIncident.incidentId || selectedIncident.id}</span>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      style={{ ...primaryButtonStyle, opacity: incidentSaving ? 0.7 : 1 }}
+                      onClick={saveIncidentUpdates}
+                      disabled={incidentSaving}
+                    >
+                      {incidentSaving ? 'Saving...' : 'Save updates'}
+                    </button>
+                  </div>
+
+                  <div style={incidentDetailGridStyle}>
+                    <div style={infoSectionStyle}>
+                      <h3 style={sectionTitleStyle}>User report</h3>
+                      <div style={infoListStyle}>
+                        <div style={infoItemStyle}><span>Transaction ID</span><span>{selectedIncident.transactionId || 'N/A'}</span></div>
+                        <div style={infoItemStyle}><span>User ID</span><span>{selectedIncident.userId || 'N/A'}</span></div>
+                        <div style={infoItemStyle}><span>Reason</span><span>{selectedIncident.userReason || 'N/A'}</span></div>
+                        <div style={infoItemStyle}><span>Created at</span><span>{selectedIncident.createdAt || 'N/A'}</span></div>
+                      </div>
+                      <div style={incidentLongTextStyle}>
+                        {selectedIncident.userDescription || 'No user description provided.'}
+                      </div>
+                      <div style={{ marginTop: 12 }}>
+                        <strong>Attachments:</strong>
+                        {selectedIncident.userAttachments?.length ? (
+                          <ul style={incidentAttachmentListStyle}>
+                            {selectedIncident.userAttachments.map((uri, idx) => (
+                              <li key={`${uri}-${idx}`}>{uri}</li>
+                            ))}
+                          </ul>
+                        ) : (
+                          <p style={{ marginTop: 8, color: '#6b7280' }}>No attachments.</p>
+                        )}
+                      </div>
+                    </div>
+
+                    <div style={infoSectionStyle}>
+                      <h3 style={sectionTitleStyle}>Admin actions</h3>
+                      <div style={incidentFormGridStyle}>
+                        <label style={incidentLabelStyle}>
+                          Status
+                          <select
+                            value={incidentDraft.status}
+                            onChange={(e) => setIncidentDraft((prev) => ({ ...prev, status: e.target.value }))}
+                            style={incidentInputStyle}
+                          >
+                            {INCIDENT_STATUSES.map((status) => (
+                              <option key={status} value={status}>{getIncidentStatusLabel(status)}</option>
+                            ))}
+                          </select>
+                        </label>
+                        <label style={incidentLabelStyle}>
+                          Fraud category
+                          <input
+                            value={incidentDraft.fraudCategory}
+                            onChange={(e) => setIncidentDraft((prev) => ({ ...prev, fraudCategory: e.target.value }))}
+                            style={incidentInputStyle}
+                            placeholder="e.g. social engineering"
+                          />
+                        </label>
+                        <label style={incidentLabelStyle}>
+                          Action taken
+                          <input
+                            value={incidentDraft.actionTaken}
+                            onChange={(e) => setIncidentDraft((prev) => ({ ...prev, actionTaken: e.target.value }))}
+                            style={incidentInputStyle}
+                            placeholder="e.g. account blocked"
+                          />
+                        </label>
+                        <label style={incidentLabelStyle}>
+                          Admin notes
+                          <textarea
+                            value={incidentDraft.adminNotes}
+                            onChange={(e) => setIncidentDraft((prev) => ({ ...prev, adminNotes: e.target.value }))}
+                            style={incidentTextareaStyle}
+                            placeholder="Add investigation notes"
+                          />
+                        </label>
+                        <label style={incidentLabelStyle}>
+                          Add timeline message
+                          <textarea
+                            value={incidentDraft.adminMessage}
+                            onChange={(e) => setIncidentDraft((prev) => ({ ...prev, adminMessage: e.target.value }))}
+                            style={incidentTextareaStyle}
+                            placeholder="Optional message for user-visible history"
+                          />
+                        </label>
+                        <label style={incidentCheckboxStyle}>
+                          <input
+                            type="checkbox"
+                            checked={incidentDraft.reportedToI4C}
+                            onChange={(e) => setIncidentDraft((prev) => ({ ...prev, reportedToI4C: e.target.checked }))}
+                          />
+                          Reported to I4C
+                        </label>
+                        <label style={incidentLabelStyle}>
+                          I4C document ID
+                          <input
+                            value={incidentDraft.i4cDocId}
+                            onChange={(e) => setIncidentDraft((prev) => ({ ...prev, i4cDocId: e.target.value }))}
+                            style={incidentInputStyle}
+                            placeholder="Set when reported to I4C"
+                          />
+                        </label>
+                        <button
+                          type="button"
+                          style={{ ...buttonStyle, backgroundColor: '#7c3aed' }}
+                          onClick={() => setIncidentDraft((prev) => ({
+                            ...prev,
+                            reportedToI4C: true,
+                            status: prev.status === 'OPENED_BY_USER' ? 'ESCALATED' : prev.status
+                          }))}
+                        >
+                          Mark for I4C escalation
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div style={{ ...infoSectionStyle, marginTop: 16 }}>
+                    <h3 style={sectionTitleStyle}>Timeline</h3>
+                    {selectedIncident.timeline?.length ? (
+                      <div style={incidentTimelineListStyle}>
+                        {selectedIncident.timeline
+                          .slice()
+                          .sort((a, b) => String(b?.createdAt || '').localeCompare(String(a?.createdAt || '')))
+                          .map((event, index) => (
+                            <div key={`${event?.eventId || index}-${index}`} style={incidentTimelineItemStyle}>
+                              <div style={incidentTimelineTopStyle}>
+                                <span style={incidentTimelineTypeStyle}>{event?.type || 'EVENT'}</span>
+                                <span style={timestampStyle}>{event?.createdAt || 'N/A'}</span>
+                              </div>
+                              <div style={{ color: '#1f2937', marginBottom: 4 }}>{event?.message || 'No message'}</div>
+                              <div style={{ fontSize: 12, color: '#6b7280' }}>
+                                byAdminId: {event?.byAdminId || 'N/A'} | byUserId: {event?.byUserId || 'N/A'}
+                              </div>
+                            </div>
+                          ))}
+                      </div>
+                    ) : (
+                      <p style={{ color: '#6b7280' }}>No timeline entries.</p>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  };
+
   // Analytics Dashboard (unchanged from original)
   const AnalyticsDashboard = () => {
     // Generate chart data from real transactions
@@ -2153,6 +2703,7 @@ const FraudLensAdminPanel = () => {
           <div style={navTabsStyle}>
             {[
               { id: 'alerts', label: 'Live Alerts', icon: AlertTriangle },
+              { id: 'incidents', label: 'Incidents', icon: FileWarning },
               { id: 'map', label: 'Map View', icon: Map },
               { id: 'ip-management', label: 'IP Management', icon: Wifi },
               { id: 'analytics', label: 'Analytics', icon: TrendingUp },
@@ -2169,6 +2720,9 @@ const FraudLensAdminPanel = () => {
               >
                 <Icon size={18} />
                 {label}
+                {id === 'incidents' && incidentsInboxCount > 0 && (
+                  <span style={navBadgeStyle}>{incidentsInboxCount}</span>
+                )}
               </button>
             ))}
           </div>
@@ -2220,6 +2774,8 @@ const FraudLensAdminPanel = () => {
         )}
         
         {activeTab === 'map' && <MapView />}
+
+        {activeTab === 'incidents' && <IncidentsPanel />}
         
         {activeTab === 'ip-management' && <IPManagement />}
         
@@ -2983,6 +3539,20 @@ const activeNavTabStyle = {
   borderBottomColor: '#2563eb'
 };
 
+const navBadgeStyle = {
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  minWidth: 20,
+  height: 20,
+  borderRadius: 999,
+  backgroundColor: '#dc2626',
+  color: 'white',
+  fontSize: 11,
+  fontWeight: 700,
+  padding: '0 6px'
+};
+
 const mainStyle = {
   maxWidth: '1200px',
   margin: '0 auto',
@@ -3448,6 +4018,207 @@ const alertsLayoutStyle = {
   gap: '32px',
   // Default grid stretch makes the alerts card as tall as Case Review while the list is max 400px — huge empty band.
   alignItems: 'start'
+};
+
+const incidentsLayoutStyle = {
+  display: 'grid',
+  gridTemplateColumns: 'minmax(360px, 1fr) minmax(440px, 1.2fr)',
+  gap: 20,
+  alignItems: 'start'
+};
+
+const incidentFilterTabsStyle = {
+  display: 'flex',
+  gap: 8,
+  flexWrap: 'wrap'
+};
+
+const incidentFilterButtonStyle = {
+  border: '1px solid #d1d5db',
+  backgroundColor: 'white',
+  color: '#374151',
+  borderRadius: 6,
+  padding: '8px 10px',
+  cursor: 'pointer',
+  fontSize: 13,
+  fontWeight: 500
+};
+
+const incidentFilterButtonActiveStyle = {
+  borderColor: '#2563eb',
+  color: '#1d4ed8',
+  backgroundColor: '#eff6ff'
+};
+
+const incidentListStyle = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 10,
+  maxHeight: 'calc(100vh - 280px)',
+  overflowY: 'auto',
+  paddingRight: 4
+};
+
+const incidentCardStyle = {
+  border: '1px solid #e5e7eb',
+  borderRadius: 10,
+  padding: 12,
+  cursor: 'pointer',
+  backgroundColor: 'white'
+};
+
+const incidentCardActiveStyle = {
+  borderColor: '#2563eb',
+  boxShadow: '0 0 0 1px rgba(37, 99, 235, 0.25)'
+};
+
+const incidentCardTopStyle = {
+  display: 'flex',
+  justifyContent: 'space-between',
+  alignItems: 'center',
+  gap: 8,
+  marginBottom: 8
+};
+
+const incidentStatusPillStyle = {
+  padding: '4px 8px',
+  borderRadius: 999,
+  fontSize: 11,
+  fontWeight: 700,
+  color: 'white',
+  textTransform: 'uppercase',
+  letterSpacing: 0.2
+};
+
+const incidentCardBodyStyle = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 6,
+  color: '#1f2937',
+  fontSize: 13
+};
+
+const incidentDescriptionSnippetStyle = {
+  color: '#4b5563',
+  display: '-webkit-box',
+  WebkitLineClamp: 2,
+  WebkitBoxOrient: 'vertical',
+  overflow: 'hidden'
+};
+
+const incidentRiskSignalsStyle = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 4,
+  marginTop: 4,
+  color: '#6b7280',
+  fontSize: 12
+};
+
+const incidentCardActionsStyle = {
+  marginTop: 10,
+  display: 'flex',
+  justifyContent: 'flex-end'
+};
+
+const incidentDetailStyle = {
+  border: '1px solid #e5e7eb',
+  borderRadius: 10,
+  padding: 16,
+  backgroundColor: '#f9fafb',
+  minHeight: 420
+};
+
+const incidentDetailGridStyle = {
+  display: 'grid',
+  gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
+  gap: 16
+};
+
+const incidentLongTextStyle = {
+  marginTop: 12,
+  borderRadius: 8,
+  border: '1px solid #e5e7eb',
+  padding: 10,
+  backgroundColor: 'white',
+  color: '#374151',
+  fontSize: 13,
+  lineHeight: 1.5
+};
+
+const incidentAttachmentListStyle = {
+  marginTop: 8,
+  marginBottom: 0,
+  paddingLeft: 18,
+  color: '#374151',
+  fontSize: 12
+};
+
+const incidentFormGridStyle = {
+  display: 'grid',
+  gap: 12
+};
+
+const incidentLabelStyle = {
+  display: 'grid',
+  gap: 6,
+  color: '#374151',
+  fontSize: 13,
+  fontWeight: 600
+};
+
+const incidentInputStyle = {
+  border: '1px solid #d1d5db',
+  borderRadius: 6,
+  padding: '8px 10px',
+  fontSize: 13,
+  fontWeight: 400
+};
+
+const incidentTextareaStyle = {
+  ...incidentInputStyle,
+  minHeight: 88,
+  resize: 'vertical'
+};
+
+const incidentCheckboxStyle = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: 8,
+  fontSize: 13,
+  color: '#374151',
+  fontWeight: 600
+};
+
+const incidentTimelineListStyle = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 8,
+  maxHeight: 280,
+  overflowY: 'auto'
+};
+
+const incidentTimelineItemStyle = {
+  border: '1px solid #e5e7eb',
+  borderRadius: 8,
+  padding: 10,
+  backgroundColor: 'white'
+};
+
+const incidentTimelineTopStyle = {
+  display: 'flex',
+  justifyContent: 'space-between',
+  alignItems: 'center',
+  marginBottom: 4
+};
+
+const incidentTimelineTypeStyle = {
+  fontSize: 11,
+  fontWeight: 700,
+  color: '#1d4ed8',
+  backgroundColor: '#dbeafe',
+  borderRadius: 999,
+  padding: '4px 8px'
 };
 
 const loadingContainerStyle = {
